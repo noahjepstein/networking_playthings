@@ -1,0 +1,268 @@
+/*
+    Filename: a2.c
+    Author: Noah J. Epstein
+    Date Created: 10.16.2016
+
+    This file satisfies assignment 3 for F16 -- Comp112.
+
+    This file implements a simple file transfer protocol using UDP.
+
+    Compile:  > gcc -g a3.c -lnsl
+
+    Run:      > ./a.out PORTNUM [-verbose]
+
+    Contact: noahjepstein@gmail.com
+*/
+
+#include <stdio.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/fcntl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+/****************************** GLOBAL CONSTS *********************************/
+
+#define WRITEBUFSIZE 512
+#define MAX_QUEUESIZE 50
+#define FILENAMESIZE 20
+#define READBUFLEN 512
+#define RRQSIZE 22
+#define MAX_MSGSIZE 514
+#define TYPESIZE 1
+#define WINDSIZE 1
+#define ACKSIZE 2
+#define SEQSIZE 1
+#define RRQ 1
+#define DATA 2
+#define ACK 3
+#define ERROR 4
+
+
+/***************************** TYPE DEFINITONS ********************************/
+
+typedef struct Message {
+    char type;          /* RRQ = 1; DATA = 2; ACK = 3; ERROR = 4 */
+    char cwnd;          /* valid values are 1-9 */
+    char seqnum;        /* valid values 0-50 -> max file size is 512 * 50 */
+    char filename[FILENAMESIZE];  /* filename at most 19 chars + null */
+    char data[WRITEBUFSIZE];     /* can contain no data */
+} Message;
+
+typedef struct MessageQueue {
+    int nEnqueued;
+    Message msgs[MAX_QUEUESIZE];
+} MessageQueue;
+
+typedef enum {LOW, HIGH} Verbosity;
+
+/***************************** FUNC PROTOTYPES ********************************/
+
+void error(const char *msg);
+
+void printMsg(const char* msg);
+
+bool processRequest(char* requestbuf);
+
+bool makeMsgQueue(char* filename);
+
+bool makeErrorMsg();
+
+void sendMsgQueue();
+
+/******************************* GLOBAL VARS **********************************/
+
+Verbosity verb;
+char filename[FILENAMESIZE];
+char readbuf[READBUFLEN];
+char writebuf[WRITEBUFSIZE];
+MessageQueue msgQ;
+
+/******************************************************************************/
+
+
+int main(int argc, char* argv[]) {
+
+    /*** var/obj initialization ***/
+
+    int sockfd, newsockfd, portno, n, select_n, optval, flags;
+    struct sockaddr_in serv_addr, cli_addr, *pV4Addr;
+    struct hostent *hostp;
+    char* hostaddrp;
+    bool msgComplete;
+    bzero((char *) &serv_addr, sizeof(serv_addr));
+    socklen_t clilen = sizeof(cli_addr);
+
+    /* input processing */
+
+    if ((argc < 2) || (argc > 3)) {
+        fprintf(stderr,"ERROR, proper usage is >./a.out PORTNUM [-verbose] \n");
+        exit(1);
+    }
+    if (argc == 3) {
+        if ((strcmp(argv[2], "-v") == 0) || (strcmp(argv[2], "-verbose") == 0)) {
+            verb = HIGH;
+        } else {
+            fprintf(stderr,
+                    "ERROR, proper usage is >./a.out PORTNUM [-verbose] \n");
+            exit(1);
+        }
+    }
+
+    /* main sock initialization */
+
+    portno = atoi(argv[1]);
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0)
+       error("ERROR creating socket");
+
+    /* use this option so that the os doesn't hold onto the port after server
+       shutdown (for debugging, running server multiple times in succession) */
+
+    optval = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
+                                                                   sizeof(int));
+
+    bzero((char*) &serv_addr, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(portno);
+
+    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0)
+         error("ERROR on binding");
+
+    /*** MAIN PROCESSING LOOP */
+
+    while (1) {
+
+        /* recieve initial message from a client */
+
+        memset(readbuf, 0, READBUFLEN);
+        memset((char*) msgQ.msgs, 0, MAX_QUEUESIZE * sizeof(Message));
+        msgQ.nEnqueued = 0;
+
+        n = recvfrom(sockfd, readbuf, READBUFLEN, 0, (struct sockaddr *) &cli_addr, &clilen);
+
+        if (n < 0) {
+            error("recvfrom error!");
+
+        } else if (n == ACKSIZE) {
+            printMsg("Getting an ack on initial read from client -- shouldn't happen");
+            continue;
+
+        } else if (n == READBUFLEN) {
+            printMsg("Got RRQ. Processing and making response.");
+            msgComplete = processRequest(readbuf);
+
+        } else {
+            printMsg("Malformed message to server. Ignoring message. ");
+            continue;
+        }
+
+        if (msgComplete) {
+            sendMsgQueue();
+        } else {
+            printMsg("Message constructor failed.");
+        }
+    }
+
+    printMsg("Terminating server.");
+    close(sockfd);
+    return 0;
+}
+
+/********************************* FUNC DFNS **********************************/
+
+/* exits with code 1 and prints the error message 'msg' */
+void error(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+/* prints messages to stdout when verbosity is turned on */
+void printMsg(const char* msg) {
+
+    if (verb == LOW) {
+        return;
+
+    } else {
+        printf("%s\n", msg);
+    }
+}
+
+bool processRequest(char* requestbuf) {
+
+    bool success = false;
+    int type = (int) requestbuf[0];
+    int cwnd = (int) requestbuf[1];
+    strncpy(filename, &requestbuf[2], FILENAMESIZE);
+
+    if (type != RRQ) {
+
+        printMsg("Packet of size RRQSIZE: 22 did not have type RRQ");
+        return false;
+
+    } else {
+
+        if( access(filename, F_OK) != -1 ) {
+            success = makeMsgQueue(filename);
+        } else {
+            success = makeErrorMsg();
+        }
+    }
+
+    return success;
+}
+
+bool makeMsgQueue(char* filename) {
+
+    int fd;
+    int n = WRITEBUFSIZE;
+    int i = 0;
+    bool success = false;
+
+    FILE *fp = fopen(filename, "r");
+    if (fp == NULL) {
+        error("Error opening file.");
+    } else {
+        fd = fileno(fp);
+    }
+
+
+    while ((n == WRITEBUFSIZE) && (i < MAX_QUEUESIZE)) {
+        n = read(fd, msgQ.msgs[i].data, WRITEBUFSIZE);
+        msgQ.msgs[i].seqnum = i;
+        msgQ.msgs[i].type = DATA;
+        msgQ.nEnqueued++;
+        i++;
+    }
+
+    if (n >= 0) {
+        printMsg("Last message has partial data");
+        success = true;
+    } else if (n == -1) {
+        error("Error reading from file.");
+    }
+
+    fclose(fp);
+    return success;
+}
+
+bool makeErrorMsg() {
+    msgQ.msgs[0].type = (char) ERROR;
+    msgQ.nEnqueued = 1;
+    return true;
+}
+
+void sendMsgQueue() {
+    return;
+}
